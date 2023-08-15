@@ -16,8 +16,10 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 
-from llama.model import ModelArgs, Transformer
-from llama.tokenizer import Tokenizer
+from llama.llama.model import ModelArgs, Transformer
+from llama.llama.tokenizer import Tokenizer
+
+from pdb import set_trace as bp
 
 Role = Literal["system", "user", "assistant"]
 
@@ -56,6 +58,7 @@ class Llama:
         max_seq_len: int,
         max_batch_size: int,
         model_parallel_size: Optional[int] = None,
+        local_rank: Optional[int] = None,
     ) -> "Llama":
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
@@ -64,14 +67,15 @@ class Llama:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
+        if local_rank is None:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        #torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
         torch.manual_seed(1)
 
-        if local_rank > 0:
-            sys.stdout = open(os.devnull, "w")
+        #if local_rank > 0:
+        #    sys.stdout = open(os.devnull, "w")
 
         start_time = time.time()
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
@@ -94,13 +98,16 @@ class Llama:
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        device = torch.device('cuda:' + str(local_rank))
+        model = model.to(device)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
-        return Llama(model, tokenizer)
+        return Llama(model, tokenizer, local_rank)
 
-    def __init__(self, model: Transformer, tokenizer: Tokenizer):
+    def __init__(self, model: Transformer, tokenizer: Tokenizer, local_rank = None):
         self.model = model
         self.tokenizer = tokenizer
+        self.local_rank = local_rank
 
     @torch.inference_mode()
     def generate(
@@ -123,15 +130,20 @@ class Llama:
 
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        device = torch.device('cuda:' + str(self.local_rank))
+        tokens = tokens.to(device)
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
+            token_logprobs = token_logprobs.to(device)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device="cuda").to(device)
+
         input_text_mask = tokens != pad_id
         for cur_pos in range(min_prompt_len, total_len):
+
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
